@@ -128,3 +128,87 @@ def test_flash_attn_varlen_graph(is_causal):
     torch.npu.synchronize()
 
     assert_fa_close(output_npu, golden_out_ref, golden_out_pt, name="graph out")
+
+
+@pytest.mark.parametrize("head_size", [128, 256])
+@pytest.mark.parametrize("kv_capacity", [128, 4096])
+def test_metadata_captured_with_forward_reads_updated_lengths(head_size, kv_capacity):
+    """Capture metadata and runtime writes, then replay with device-side KV updates."""
+    device_name = torch_npu.npu.get_device_name()
+    if "Ascend910" not in device_name:
+        pytest.skip("Current-stream AICPU metadata regression requires Ascend910")
+
+    batch_size, q_len, num_heads, num_kv_heads, page_size = 2, 8, 8, 2, 128
+    pages_per_seq = kv_capacity // page_size
+    query = torch.randn(batch_size * q_len, num_heads, head_size, dtype=DATA_TYPE, device="npu")
+    key = torch.randn(
+        batch_size * pages_per_seq,
+        page_size,
+        num_kv_heads,
+        head_size,
+        dtype=DATA_TYPE,
+        device="npu",
+    )
+    value = torch.randn_like(key)
+    lengths = torch.full((batch_size,), kv_capacity, dtype=torch.int32, device="npu")
+    cu_query = torch.arange(batch_size + 1, dtype=torch.int32, device="npu") * q_len
+    pages = torch.arange(batch_size * pages_per_seq, dtype=torch.int32, device="npu").view(
+        batch_size, pages_per_seq
+    )
+    scale = head_size**-0.5
+
+    def forward():
+        metadata = get_scheduler_metadata(
+            max_seqlen_q=q_len,
+            max_seqlen_k=kv_capacity,
+            nheads=num_heads,
+            nheads_kv=num_kv_heads,
+            headdim=head_size,
+            num_splits=0,
+            cu_seqlens_q=cu_query,
+            seqused_k=lengths,
+            causal=False,
+        )
+        return flash_attn_varlen_func(
+            query,
+            key,
+            value,
+            cu_seqlens_q=cu_query,
+            seqused_k=lengths,
+            page_table=pages,
+            max_seqlen_q=q_len,
+            max_seqlen_k=kv_capacity,
+            softmax_scale=scale,
+            causal=False,
+            scheduler_metadata=metadata,
+            num_splits=0,
+        )
+
+    for _ in range(3):
+        forward()
+    torch.npu.synchronize()
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        captured = forward()
+
+    for length in (kv_capacity, 65, kv_capacity // 2):
+        lengths.fill_(length)
+        graph.replay()
+        actual = captured.clone()
+        eager = forward()
+        torch.npu.synchronize()
+        torch.testing.assert_close(actual, eager, atol=0.02, rtol=0.02)
+
+        query_ref = query.float().cpu().reshape(batch_size, q_len, num_heads, head_size)
+        key_ref = key.float().cpu().reshape(batch_size, kv_capacity, num_kv_heads, head_size)
+        value_ref = value.float().cpu().reshape(batch_size, kv_capacity, num_kv_heads, head_size)
+        key_ref = key_ref[:, :length].repeat_interleave(num_heads // num_kv_heads, dim=2)
+        value_ref = value_ref[:, :length].repeat_interleave(num_heads // num_kv_heads, dim=2)
+        scores = torch.einsum("bqhd,bkhd->bhqk", query_ref, key_ref) * scale
+        reference = torch.einsum("bhqk,bkhd->bqhd", scores.softmax(-1), value_ref)
+        torch.testing.assert_close(
+            actual.float().cpu(),
+            reference.reshape(batch_size * q_len, num_heads, head_size),
+            atol=0.02,
+            rtol=0.02,
+        )

@@ -51,48 +51,14 @@ static at::Tensor GetSchedulerMetadataImpl(FAMetadataArgs args, const at::Tensor
     at::Tensor meta = at::empty({bytes}, at::device(at::kPrivateUse1).dtype(at::kByte));
     args.metaOutAddr = reinterpret_cast<uint64_t>(meta.data_ptr());
 
-    c10_npu::NPUStream currentStream = c10_npu::getCurrentNPUStream();
-    c10_npu::NPUStream aicpuStream = c10_npu::getNPUStreamFromPool();
-    aclrtStream curHandle = currentStream.stream(false);
-    aclrtStream aicpuHandle = aicpuStream.stream(false);
-
-    // Events are per-device and thread-local so they outlive the async
-    // RunOpApiV2 command (a fresh event destroyed right after RunOpApiV2 returns
-    // gets a use-after-free inside the deferred task -> "invalid handle" on
-    // aclrtRecordEvent).
-    struct MetadataEvents {
-        aclrtEvent inputReady = nullptr;
-        aclrtEvent metadataDone = nullptr;
-    };
-    static thread_local std::unordered_map<c10::DeviceIndex, MetadataEvents> eventsByDevice;
-    MetadataEvents& events = eventsByDevice[currentStream.device_index()];
-    if (events.inputReady == nullptr) {
-        ACL_CHECK(aclrtCreateEvent(&events.inputReady));
-        ACL_CHECK(aclrtCreateEvent(&events.metadataDone));
-    }
-
-    // Launch the AICPU metadata kernel as an async task via RunOpApiV2 so it is
-    // queued against the current stream with proper event-based ordering. This
-    // matches the v3 scheduler-metadata path; a direct host-side launch (even
-    // with aclrtSynchronizeStream) races the forward kernel on the first call in
-    // a fresh process, leaving the tiling uninitialized (all-zero output / lse=inf).
-    FAMetadataArgs metaArgs = args;
-    auto metadata_task = [curHandle, aicpuHandle, inputReady = events.inputReady, metadataDone = events.metadataDone,
-                          metaArgs]() mutable -> int {
-        ACL_CHECK(aclrtRecordEvent(inputReady, curHandle));
-        ACL_CHECK(aclrtStreamWaitEvent(aicpuHandle, inputReady));
-        ComputeFAMetadataV4<<<1, nullptr, aicpuHandle>>>(&metaArgs, sizeof(metaArgs));
-        ACL_CHECK(aclrtRecordEvent(metadataDone, aicpuHandle));
-        ACL_CHECK(aclrtStreamWaitEvent(curHandle, metadataDone));
+    // Keep metadata on the caller's stream so graph replay re-reads lengths.
+    // Retain the tensors until the deferred command has launched.
+    auto aclStream = c10_npu::getCurrentNPUStream().stream(false);
+    auto metadata_task = [aclStream, metaArgs = args, meta, seqlensK, seqlensQ]() mutable -> int {
+        ComputeFAMetadataV4<<<1, nullptr, aclStream>>>(&metaArgs, sizeof(metaArgs));
         return 0;
     };
     at_npu::native::OpCommand::RunOpApiV2("ascendc_fa_metadata", metadata_task);
-
-    c10_npu::NPUCachingAllocator::recordStream(meta.storage().data_ptr(), aicpuStream);
-    c10_npu::NPUCachingAllocator::recordStream(seqlensK.storage().data_ptr(), aicpuStream);
-    if (seqlensQ.has_value()) {
-        c10_npu::NPUCachingAllocator::recordStream(seqlensQ->storage().data_ptr(), aicpuStream);
-    }
     return meta;
 }
 
@@ -402,33 +368,12 @@ std::vector<at::Tensor> mha_fwd(
         fwdRuntimeArgs.runtimeAddr = reinterpret_cast<uint64_t>(runtimeDevice);
         fwdRuntimeArgs.runtime = runtimeData;
 
-        c10_npu::NPUStream curStream = c10_npu::getCurrentNPUStream();
-        c10_npu::NPUStream rtStream = c10_npu::getNPUStreamFromPool();
-        aclrtStream rtHandle = rtStream.stream(false);
-
-        struct RuntimeEvents {
-            aclrtEvent inputReady = nullptr;
-            aclrtEvent runtimeDone = nullptr;
-        };
-        static thread_local std::unordered_map<c10::DeviceIndex, RuntimeEvents> rtEventsByDevice;
-        RuntimeEvents& rtEvents = rtEventsByDevice[curStream.device_index()];
-        if (rtEvents.inputReady == nullptr) {
-            constexpr uint32_t event_flags = ACL_EVENT_SYNC | ACL_EVENT_CAPTURE_STREAM_PROGRESS;
-            ACL_CHECK(aclrtCreateEventExWithFlag(&rtEvents.inputReady, event_flags));
-            ACL_CHECK(aclrtCreateEventExWithFlag(&rtEvents.runtimeDone, event_flags));
-        }
-
-        auto write_runtime_task = [curHandle = aclStream, rtHandle, inputReady = rtEvents.inputReady,
-                                   runtimeDone = rtEvents.runtimeDone, fwdRuntimeArgs]() mutable -> int {
-            ACL_CHECK(aclrtRecordEvent(inputReady, curHandle));
-            ACL_CHECK(aclrtStreamWaitEvent(rtHandle, inputReady));
-            WriteFARuntime<<<1, nullptr, rtHandle>>>(&fwdRuntimeArgs, sizeof(fwdRuntimeArgs));
-            ACL_CHECK(aclrtRecordEvent(runtimeDone, rtHandle));
-            ACL_CHECK(aclrtStreamWaitEvent(curHandle, runtimeDone));
+        // Runtime data must follow the same stream order as metadata and forward.
+        auto write_runtime_task = [aclStream, fwdRuntimeArgs, runtime_gpu_tensor]() mutable -> int {
+            WriteFARuntime<<<1, nullptr, aclStream>>>(&fwdRuntimeArgs, sizeof(fwdRuntimeArgs));
             return 0;
         };
         at_npu::native::OpCommand::RunOpApiV2("ascendc_fa_write_runtime", write_runtime_task);
-        c10_npu::NPUCachingAllocator::recordStream(runtime_gpu_tensor.storage().data_ptr(), rtStream);
     } else {
         at::Tensor tiling_cpu_tensor =
             at::empty({static_cast<int64_t>(sizeof(FAInferStaticTilingData))}, at::device(c10::kCPU).dtype(at::kByte));
