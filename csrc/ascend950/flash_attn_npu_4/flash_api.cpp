@@ -10,7 +10,6 @@
 #include <torch/extension.h>
 #include <cmath>
 #include <cstring>
-#include <unordered_map>
 
 #include "device_triu_mask.h"
 #include "fa_metadata_args.h"
@@ -22,7 +21,6 @@
 #include "acl/acl.h"
 
 extern __global__ __aicpu__ uint32_t ComputeFAMetadata(void* args);
-#define ACL_CHECK(expr) TORCH_CHECK((expr) == ACL_SUCCESS, #expr " failed")
 
 static at::Tensor GetSchedulerMetadataImpl(FAMetadataArgs args, const at::Tensor& cache_seqlens,
                                            const std::optional<at::Tensor>& cu_seqlens_q,
@@ -31,47 +29,33 @@ static at::Tensor GetSchedulerMetadataImpl(FAMetadataArgs args, const at::Tensor
     auto metadata = at::empty({static_cast<int64_t>(fa_metadata::MetadataBytes(false))},
                               at::device(at::kPrivateUse1).dtype(at::kByte));
     args.metaOutAddr = reinterpret_cast<uint64_t>(metadata.data_ptr());
+    // Submit through the deferred op queue, but keep metadata on the caller's
+    // stream so graph capture needs no pool-stream event handshake. Retain all
+    // tensors whose addresses are embedded in args until the task is launched.
     auto current = c10_npu::getCurrentNPUStream();
-    auto aicpu = c10_npu::getNPUStreamFromPool();
-    aclrtStream current_handle = current.stream(false);
-    aclrtStream aicpu_handle = aicpu.stream(false);
-    struct MetadataEvents {
-        aclrtEvent input_ready = nullptr;
-        aclrtEvent done = nullptr;
-    };
-    static thread_local std::unordered_map<c10::DeviceIndex, MetadataEvents> events_by_device;
-    auto& events = events_by_device[current.device_index()];
-    if (events.input_ready == nullptr) {
-        ACL_CHECK(aclrtCreateEvent(&events.input_ready));
-        ACL_CHECK(aclrtCreateEvent(&events.done));
-    }
-    auto task = [current_handle, aicpu_handle, input_ready = events.input_ready, done = events.done,
-                 args]() mutable -> int {
-        ACL_CHECK(aclrtRecordEvent(input_ready, current_handle));
-        ACL_CHECK(aclrtStreamWaitEvent(aicpu_handle, input_ready));
-        ComputeFAMetadata<<<1, nullptr, aicpu_handle>>>(&args, sizeof(args));
-        ACL_CHECK(aclrtRecordEvent(done, aicpu_handle));
-        ACL_CHECK(aclrtStreamWaitEvent(current_handle, done));
+    auto current_handle = current.stream(false);
+    auto task = [current_handle, args, metadata, cache_seqlens, cu_seqlens_q, seqused_q]() mutable -> int {
+        ComputeFAMetadata<<<1, nullptr, current_handle>>>(&args, sizeof(args));
         return 0;
     };
     at_npu::native::OpCommand::RunOpApiV2("ascendc_fa_metadata", task);
-    c10_npu::NPUCachingAllocator::recordStream(metadata.storage().data_ptr(), aicpu);
-    c10_npu::NPUCachingAllocator::recordStream(cache_seqlens.storage().data_ptr(), aicpu);
+    // Inputs may have been allocated on a different caller stream. Protect
+    // their storage until this stream has finished reading them.
+    c10_npu::NPUCachingAllocator::recordStream(cache_seqlens.storage().data_ptr(), current);
     if (cu_seqlens_q.has_value()) {
-        c10_npu::NPUCachingAllocator::recordStream(cu_seqlens_q->storage().data_ptr(), aicpu);
+        c10_npu::NPUCachingAllocator::recordStream(cu_seqlens_q->storage().data_ptr(), current);
     }
     if (seqused_q.has_value()) {
-        c10_npu::NPUCachingAllocator::recordStream(seqused_q->storage().data_ptr(), aicpu);
+        c10_npu::NPUCachingAllocator::recordStream(seqused_q->storage().data_ptr(), current);
     }
     return metadata;
 }
 
 at::Tensor get_scheduler_metadata(int64_t batch_size, int64_t max_seqlen_q, int64_t max_seqlen_k, int64_t num_heads_q,
-                                  int64_t num_heads_kv, int64_t headdim, int64_t headdim_v,
-                                  at::Tensor cache_seqlens, std::optional<at::Tensor> cu_seqlens_q = std::nullopt,
-                                  bool causal = false,
-                                  int64_t window_left = -1, int64_t window_right = -1,
-                                  int64_t num_splits = 0, std::optional<bool> pack_gqa = std::nullopt, int64_t = 0,
+                                  int64_t num_heads_kv, int64_t headdim, int64_t headdim_v, at::Tensor cache_seqlens,
+                                  std::optional<at::Tensor> cu_seqlens_q = std::nullopt, bool causal = false,
+                                  int64_t window_left = -1, int64_t window_right = -1, int64_t num_splits = 0,
+                                  std::optional<bool> pack_gqa = std::nullopt, int64_t = 0,
                                   std::optional<at::Tensor> seqused_q = std::nullopt)
 {
     const c10::OptionalDeviceGuard device_guard(device_of(cache_seqlens));

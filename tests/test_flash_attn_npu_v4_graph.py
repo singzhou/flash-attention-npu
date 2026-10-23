@@ -132,12 +132,15 @@ def test_flash_attn_varlen_graph(is_causal):
 
 @pytest.mark.parametrize("head_size", [128, 256])
 @pytest.mark.parametrize("kv_capacity", [128, 4096])
-def test_metadata_captured_with_forward_reads_updated_lengths(head_size, kv_capacity):
-    """Capture metadata and runtime writes, then replay with device-side KV updates."""
-    device_name = torch_npu.npu.get_device_name()
-    if "Ascend910" not in device_name:
-        pytest.skip("Current-stream AICPU metadata regression requires Ascend910")
+@pytest.mark.parametrize("use_side_stream", [False, True])
+def test_metadata_captured_with_forward_reads_updated_lengths(
+    head_size, kv_capacity, use_side_stream
+):
+    """Capture metadata and runtime writes on the default or a caller-owned stream."""
+    _check_metadata_graph_replay(head_size, kv_capacity, use_side_stream)
 
+
+def _check_metadata_graph_replay(head_size, kv_capacity, use_side_stream):
     batch_size, q_len, num_heads, num_kv_heads, page_size = 2, 8, 8, 2, 128
     pages_per_seq = kv_capacity // page_size
     query = torch.randn(batch_size * q_len, num_heads, head_size, dtype=DATA_TYPE, device="npu")
@@ -184,31 +187,42 @@ def test_metadata_captured_with_forward_reads_updated_lengths(head_size, kv_capa
             num_splits=0,
         )
 
-    for _ in range(3):
-        forward()
-    torch.npu.synchronize()
-    graph = torch.npu.NPUGraph()
-    with torch.npu.graph(graph):
-        captured = forward()
-
-    for length in (kv_capacity, 65, kv_capacity // 2):
-        lengths.fill_(length)
-        graph.replay()
-        actual = captured.clone()
-        eager = forward()
+    # Allocate inputs above on the original stream, then consume them on the
+    # chosen stream. This also exercises cross-stream input storage ownership.
+    current = torch.npu.current_stream()
+    stream = torch.npu.Stream() if use_side_stream else current
+    if use_side_stream:
+        stream.wait_stream(current)
+    with torch.npu.stream(stream):
+        for _ in range(3):
+            forward()
         torch.npu.synchronize()
-        torch.testing.assert_close(actual, eager, atol=0.02, rtol=0.02)
+        graph = torch.npu.NPUGraph()
+        with torch.npu.graph(graph):
+            captured = forward()
 
-        query_ref = query.float().cpu().reshape(batch_size, q_len, num_heads, head_size)
-        key_ref = key.float().cpu().reshape(batch_size, kv_capacity, num_kv_heads, head_size)
-        value_ref = value.float().cpu().reshape(batch_size, kv_capacity, num_kv_heads, head_size)
-        key_ref = key_ref[:, :length].repeat_interleave(num_heads // num_kv_heads, dim=2)
-        value_ref = value_ref[:, :length].repeat_interleave(num_heads // num_kv_heads, dim=2)
-        scores = torch.einsum("bqhd,bkhd->bhqk", query_ref, key_ref) * scale
-        reference = torch.einsum("bhqk,bkhd->bqhd", scores.softmax(-1), value_ref)
-        torch.testing.assert_close(
-            actual.float().cpu(),
-            reference.reshape(batch_size * q_len, num_heads, head_size),
-            atol=0.02,
-            rtol=0.02,
-        )
+        for length in (kv_capacity, 65, kv_capacity // 2):
+            lengths.fill_(length)
+            graph.replay()
+            actual = captured.clone()
+            eager = forward()
+            torch.npu.synchronize()
+            torch.testing.assert_close(actual, eager, atol=0.02, rtol=0.02)
+
+            query_ref = query.float().cpu().reshape(batch_size, q_len, num_heads, head_size)
+            key_ref = key.float().cpu().reshape(batch_size, kv_capacity, num_kv_heads, head_size)
+            value_ref = (
+                value.float().cpu().reshape(batch_size, kv_capacity, num_kv_heads, head_size)
+            )
+            key_ref = key_ref[:, :length].repeat_interleave(num_heads // num_kv_heads, dim=2)
+            value_ref = value_ref[:, :length].repeat_interleave(num_heads // num_kv_heads, dim=2)
+            scores = torch.einsum("bqhd,bkhd->bhqk", query_ref, key_ref) * scale
+            reference = torch.einsum("bhqk,bkhd->bqhd", scores.softmax(-1), value_ref)
+            torch.testing.assert_close(
+                actual.float().cpu(),
+                reference.reshape(batch_size * q_len, num_heads, head_size),
+                atol=0.02,
+                rtol=0.02,
+            )
+    if use_side_stream:
+        current.wait_stream(stream)
